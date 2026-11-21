@@ -164,48 +164,37 @@ trace = AgentTrace(read_state_fn=_read_workflow_state)
 
 
 def _update_workflow_state(session_id: str, updates: dict,
-                           expected_version: int, max_retries: int = 3) -> dict:
+                           expected_version: int) -> dict:
     """
-    Update WorkflowState with optimistic locking.
-    """
-    from boto3.dynamodb.conditions import Attr
+    Update WorkflowState using optimistic locking.
 
+    The expected_version must be the version read before the worker call.
+    If another update changes the version, reject this stale result.
+    """
     table = dynamodb.Table(config.WORKFLOW_STATE_TABLE)
 
-    for attempt in range(max_retries):
-        try:
-            update_expr_parts = [f"{k} = :{k}" for k in updates]
-            update_expr_parts.append("version = :new_version")
-            update_expr = "SET " + ", ".join(update_expr_parts)
+    update_expr_parts = [f"{k} = :{k}" for k in updates]
+    update_expr_parts.append("version = :new_version")
+    update_expr = "SET " + ", ".join(update_expr_parts)
 
-            expr_values = {f":{k}": v for k, v in updates.items()}
-            expr_values[':new_version']      = expected_version + 1
-            expr_values[':expected_version'] = expected_version
+    expr_values = {f":{k}": v for k, v in updates.items()}
+    expr_values[":new_version"] = expected_version + 1
+    expr_values[":expected_version"] = expected_version
 
-            table.update_item(
-                Key={'session_id': session_id},
-                UpdateExpression=update_expr,
-                ConditionExpression='version = :expected_version',
-                ExpressionAttributeValues=expr_values
-            )
-            return _read_workflow_state(session_id)
+    try:
+        table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=update_expr,
+            ConditionExpression="version = :expected_version",
+            ExpressionAttributeValues=expr_values
+        )
+        return _read_workflow_state(session_id)
 
-        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-            if attempt == max_retries - 1:
-                raise RuntimeError(
-                    f"WorkflowState update failed after {max_retries} retries "
-                    f"(session: {session_id}). Too many concurrent writes."
-                )
-            logger.warning(
-                f"WorkflowState version conflict on attempt {attempt+1}, retrying..."
-            )
-            current = _read_workflow_state(session_id)
-            if current:
-                expected_version = int(current['version'])
-            time.sleep(0.1 * (attempt + 1))
-
-    raise RuntimeError("WorkflowState update: unexpected exit from retry loop")
-
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException as e:
+        raise RuntimeError(
+            f"WorkflowState version conflict for session {session_id}. "
+            f"Expected version {expected_version}; worker result was not saved."
+        ) from e
 
 # ═══════════════════════════════════════════════════════
 #  TASK 2 - MULTI-AGENT ORCHESTRATION
@@ -1031,11 +1020,10 @@ def build_orchestrator_agent(
                 "Do not make refund eligibility decisions."
             )
             result = str(response)
-            latest = _read_workflow_state(session_id) or state
             _update_workflow_state(
                 session_id,
                 {"inventory_agent": result},
-                int(latest.get("version", old_version)),
+                old_version,
             )
             trace.step_done("inventory_agent", old_version)
             return result
@@ -1059,11 +1047,10 @@ def build_orchestrator_agent(
                 f"Policy question: {request}"
             )
             result = str(response)
-            latest = _read_workflow_state(session_id) or state
             _update_workflow_state(
                 session_id,
                 {"policy_agent": result},
-                int(latest.get("version", old_version)),
+                old_version,
             )
             trace.step_done("policy_agent", old_version)
             return result
@@ -1098,11 +1085,10 @@ def build_orchestrator_agent(
                 "findings. Verify eligibility before initiating a return."
             )
             result = str(response)
-            latest = _read_workflow_state(session_id) or state
             _update_workflow_state(
                 session_id,
                 {"refund_agent": result},
-                int(latest.get("version", old_version)),
+                old_version,
             )
             trace.step_done("refund_agent", old_version)
             return result
@@ -1130,11 +1116,10 @@ def build_orchestrator_agent(
                 "Read the full WorkflowState and draft the final response."
             )
             result = str(response)
-            latest = _read_workflow_state(session_id) or state
             _update_workflow_state(
                 session_id,
                 {"communication_agent": result},
-                int(latest.get("version", old_version)),
+                old_version,
             )
             trace.step_done("communication_agent", old_version)
             return result
